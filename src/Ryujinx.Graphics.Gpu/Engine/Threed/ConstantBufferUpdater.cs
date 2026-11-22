@@ -1,4 +1,5 @@
 using Ryujinx.Graphics.Gpu.Memory;
+using Ryujinx.Memory.Range;
 using System;
 using System.Runtime.InteropServices;
 
@@ -122,6 +123,7 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
                 }
 
                 _ubFollowUpAddress = 0;
+                _ubByteCount = 0;
                 _ubIndex = 0;
             }
         }
@@ -158,19 +160,33 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
         /// <param name="data">Data to be written to the uniform buffer</param>
         public void Update(ReadOnlySpan<int> data)
         {
+            if (data.IsEmpty)
+            {
+                return;
+            }
+
             UniformBufferState uniformBuffer = _state.State.UniformBufferState;
 
             ulong address = uniformBuffer.Address.Pack() + (uint)uniformBuffer.Offset;
-
-            ulong size = (ulong)data.Length * 4;
 
             if (_ubFollowUpAddress != address || _ubIndex + data.Length > _ubData.Length)
             {
                 FlushUboDirty();
 
+                if (data.Length > _ubData.Length)
+                {
+                    WriteDirect(address, MemoryMarshal.Cast<int, byte>(data));
+
+                    _state.State.UniformBufferState.Offset += data.Length * 4;
+
+                    return;
+                }
+
                 _ubByteCount = 0;
                 _ubBeginCpuAddress = _channel.MemoryManager.Translate(address);
             }
+
+            ulong size = (ulong)data.Length * 4;
 
             data.CopyTo(_ubData.AsSpan(_ubIndex));
             _ubIndex += data.Length;
@@ -179,6 +195,33 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
             _ubByteCount += size;
 
             _state.State.UniformBufferState.Offset += data.Length * 4;
+        }
+
+        /// <summary>
+        /// Writes uniform buffer data directly to memory, bypassing the staging cache.
+        /// </summary>
+        /// <param name="address">GPU virtual address to write to</param>
+        /// <param name="data">Data to be written</param>
+        private void WriteDirect(ulong address, ReadOnlySpan<byte> data)
+        {
+            MemoryManager memoryManager = _channel.MemoryManager;
+            MultiRange range = memoryManager.GetPhysicalRegions(address, (ulong)data.Length);
+
+            int offset = 0;
+
+            for (int i = 0; i < range.Count; i++)
+            {
+                MemoryRange subRange = range.GetSubRange(i);
+                int subSize = (int)subRange.Size;
+
+                if (subRange.Address != MemoryManager.PteUnmapped &&
+                    memoryManager.Physical.WriteWithRedundancyCheck(subRange.Address, data.Slice(offset, subSize)))
+                {
+                    memoryManager.Physical.BufferCache.ForceDirty(memoryManager, address + (ulong)offset, subRange.Size);
+                }
+
+                offset += subSize;
+            }
         }
     }
 }
